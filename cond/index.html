@@ -170,19 +170,16 @@
 <div class="app" id="app"></div>
 
 <script>
-/* ---------- conexão com o servidor real (substitui a memória do Claude) ----------
-   Se BACKEND_URL_PADRAO e BACKEND_API_KEY_PADRAO estiverem preenchidos
-   abaixo, TODO MUNDO que abrir este arquivo usa essa conexão automaticamente
-   — sem precisar ver nenhuma tela técnica. Preencha os dois ANTES de publicar
-   o arquivo para os moradores. Se deixar em branco, cada navegador precisa
-   configurar manualmente na tela "Conectar ao servidor" (útil só para teste). */
+/* ---------- conexão com o servidor ----------
+   A página NÃO guarda mais nenhuma chave. Cada pessoa faz login (administrador,
+   síndico ou morador) e o servidor devolve um token de sessão que só permite
+   o que aquela pessoa pode fazer. */
 const BACKEND_URL_PADRAO = 'https://portalmazzoni.onrender.com';
-const BACKEND_API_KEY_PADRAO = 'N@th@li@31012002';
 
 let backendConfig = null;
 function carregarConfigServidor(){
-  if(BACKEND_URL_PADRAO && BACKEND_API_KEY_PADRAO){
-    backendConfig = { url: BACKEND_URL_PADRAO, apiKey: BACKEND_API_KEY_PADRAO };
+  if(BACKEND_URL_PADRAO){
+    backendConfig = { url: BACKEND_URL_PADRAO };
     return;
   }
   try{
@@ -195,8 +192,8 @@ function salvarConfigServidor(cfg){
   try{ localStorage.setItem('painel_condominio_servidor', JSON.stringify(cfg)); }catch(e){}
 }
 function esquecerConfigServidor(){
-  if(BACKEND_URL_PADRAO && BACKEND_API_KEY_PADRAO){
-    showToast('A conexão está fixa neste arquivo (preenchida antes de publicar). Para trocar, edite BACKEND_API_KEY_PADRAO no código.');
+  if(BACKEND_URL_PADRAO){
+    showToast('A conexão está fixa neste arquivo. Para trocar, edite BACKEND_URL_PADRAO no código.');
     return;
   }
   backendConfig = null;
@@ -205,44 +202,66 @@ function esquecerConfigServidor(){
 }
 carregarConfigServidor();
 
-window.storage = {
-  async get(key){
-    const resp = await fetch(backendConfig.url.replace(/\/+$/,'') + '/api/kv/get', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-api-key': backendConfig.apiKey },
-      body: JSON.stringify({ key })
-    });
-    if(!resp.ok) throw new Error('Falha ao ler do servidor (HTTP '+resp.status+').');
-    return await resp.json();
-  },
-  async set(key, value){
-    const resp = await fetch(backendConfig.url.replace(/\/+$/,'') + '/api/kv/set', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-api-key': backendConfig.apiKey },
-      body: JSON.stringify({ key, value })
-    });
-    if(!resp.ok) throw new Error('Falha ao gravar no servidor (HTTP '+resp.status+').');
-    return await resp.json();
-  },
-  async delete(key){
-    const resp = await fetch(backendConfig.url.replace(/\/+$/,'') + '/api/kv/delete', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-api-key': backendConfig.apiKey },
-      body: JSON.stringify({ key })
-    });
-    if(!resp.ok) throw new Error('Falha ao apagar no servidor (HTTP '+resp.status+').');
-    return await resp.json();
-  },
-  async list(prefix){
-    const resp = await fetch(backendConfig.url.replace(/\/+$/,'') + '/api/kv/list', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-api-key': backendConfig.apiKey },
-      body: JSON.stringify({ prefix })
-    });
-    if(!resp.ok) throw new Error('Falha ao listar no servidor (HTTP '+resp.status+').');
-    return await resp.json();
+/* ---------- sessões (login no servidor) ----------
+   admin e síndico: valem só enquanto a aba estiver aberta (sessionStorage);
+   morador: fica lembrado no celular (localStorage) para não digitar o código toda vez. */
+let sessoes = { admin:null, sindico:null, morador:null }; // cada uma: { token, condo?, unidade?, nome? }
+let estadoAdmin = { senhaPadrao:false, temCodigoRecuperacao:false, recoveryCriadoEm:null };
+function lerGuardado(onde, chave){ try{ const r = window[onde].getItem(chave); return r ? JSON.parse(r) : null; }catch(e){ return null; } }
+function guardar(onde, chave, valor){ try{ if(valor) window[onde].setItem(chave, JSON.stringify(valor)); else window[onde].removeItem(chave); }catch(e){} }
+function restaurarSessoes(){
+  sessoes.admin = lerGuardado('sessionStorage','portal_sessao_admin');
+  sessoes.sindico = lerGuardado('sessionStorage','portal_sessao_sindico');
+  sessoes.morador = lerGuardado('localStorage','portal_sessao_morador');
+}
+function definirSessao(papel, dados){
+  sessoes[papel] = dados;
+  guardar(papel==='morador' ? 'localStorage' : 'sessionStorage', 'portal_sessao_'+papel, dados);
+}
+// qual o maior acesso que esta pessoa tem no condomínio informado
+function papelNoCondo(condo){
+  if(sessoes.admin) return 'admin';
+  if(sessoes.sindico && sessoes.sindico.condo===condo) return 'sindico';
+  if(sessoes.morador && sessoes.morador.condo===condo) return 'morador';
+  return null;
+}
+function tokenAtual(){
+  const p = papelNoCondo(condoAtual);
+  return p ? sessoes[p].token : null;
+}
+function urlServidor(caminho){ return backendConfig.url.replace(/\/+$/,'') + caminho; }
+// chamadas que não precisam de login (entrar, recuperar senha, nome do condomínio)
+async function chamarPublico(caminho, corpo, metodo){
+  const resp = await fetch(urlServidor(caminho), metodo==='GET'
+    ? { method:'GET' }
+    : { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(corpo||{}) });
+  let dados = null; try{ dados = await resp.json(); }catch(e){}
+  if(!resp.ok){ const err = new Error((dados && dados.erro) || ('Falha de conexão com o servidor (HTTP '+resp.status+').')); err.status = resp.status; throw err; }
+  return dados;
+}
+async function sairDaSessao(papel){
+  const s = sessoes[papel]; if(!s) return;
+  definirSessao(papel, null);
+  try{ await fetch(urlServidor('/api/auth/sair'), { method:'POST', headers:{ Authorization:'Bearer '+s.token } }); }catch(e){}
+}
+function tratarSessaoExpirada(tokenUsado){
+  for(const p of ['admin','sindico','morador']){
+    if(sessoes[p] && sessoes[p].token === tokenUsado){
+      definirSessao(p, null);
+      if(p==='admin'){ masterAuth=false; if(condoAtual===null) condoScreenState='masterGate'; }
+      if(p==='sindico' || (p==='admin' && condoAtual!==null)) sindicoAuth=false;
+      if(p==='morador') moradorAuth=null;
+    }
   }
-};
+  showToast('Sua sessão expirou. Entre novamente.');
+  render();
+}
+// qualquer erro de gravação que escapar aparece na tela em vez de sumir em silêncio
+window.addEventListener('unhandledrejection', ev=>{
+  const m = ev && ev.reason && ev.reason.message;
+  if(m) showToast(m);
+});
+
 
 /* ---------- estado ---------- */
 let view = 'morador';           // morador | sindico
@@ -271,28 +290,6 @@ let condoResetAlvo = null;      // condomínio escolhido no painel do administra
 let pinEhInicial = false;      // true quando o PIN mostrado é o de um condomínio recém-criado
 let codigoRecuperacaoRecente = null; // código de recuperação do administrador, exibido uma única vez
 
-function numeroAleatorio(max){
-  if(window.crypto && window.crypto.getRandomValues){
-    const a = new Uint32Array(1); window.crypto.getRandomValues(a); return a[0] % max;
-  }
-  return Math.floor(Math.random() * max);
-}
-function gerarPINAleatorio(){
-  return String(1000 + numeroAleatorio(9000));
-}
-// Código de recuperação no formato XXXX-XXXX-XXXX (sem letras/números que se confundem: 0/O, 1/I/L)
-function gerarCodigoRecuperacao(){
-  const alfabeto = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  let s = '';
-  for(let i=0;i<12;i++){ if(i && i%4===0) s+='-'; s += alfabeto[numeroAleatorio(alfabeto.length)]; }
-  return s;
-}
-function normalizarCodigo(c){ return String(c||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
-async function hashTexto(t){
-  if(!(window.crypto && window.crypto.subtle)) throw new Error('Este navegador não suporta a verificação segura. Abra o portal pelo endereço https.');
-  const buf = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
-}
 // Grava e confirma que o servidor aceitou (para nunca mostrar uma senha que não foi salva)
 async function storageSetConfirmado(key, value){
   if(backendConfig){
@@ -304,7 +301,7 @@ async function storageSetConfirmado(key, value){
 }
 
 function defaultConfig(){
-  return { nomeCondominio:'', pin:'1234', whatsappNumero:'', whatsappTokenSalvo:false, emailEndereco:'', emailHostSalvo:false, whatsappAtivo:true, emailAtivo:true, aprovacaoObrigatoria:false, regimento: null, normasLocacao:'', salaoPreco:'', salaoRegras:'', mural: [], salaoBookings: [], contatosWhatsapp: [], contatosEmail: [] };
+  return { nomeCondominio:'', pin:'', whatsappNumero:'', whatsappTokenSalvo:false, emailEndereco:'', emailHostSalvo:false, whatsappAtivo:true, emailAtivo:true, aprovacaoObrigatoria:false, regimento: null, normasLocacao:'', salaoPreco:'', salaoRegras:'', mural: [], salaoBookings: [], contatosWhatsapp: [], contatosEmail: [] };
 }
 let config = defaultConfig();
 
@@ -315,7 +312,7 @@ let condoScreenState = 'landing'; // landing | masterGate | masterPanel
 let masterAuth = false;
 let masterPinValue = '';
 let novoCondoNome = '';
-let masterConfig = { pin:'admin123' };
+let condominiosCarregados = false; // só deixa criar/remover condomínio se a lista veio do servidor
 
 function gerarSlug(nome){
   let s = nome.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/(^-+|-+$)/g,'');
@@ -335,7 +332,8 @@ async function storageGet(key) {
 }
 async function storageSet(key, value) {
   if(backendConfig){
-    await chamarBackend('/api/kv/set', { key, value });
+    const r = await chamarBackend('/api/kv/set', { key, value });
+    if(r && r.erro) throw new Error('Não foi possível salvar: ' + r.erro);
   } else {
     await window.storage.set(key, value, true);
   }
@@ -358,21 +356,18 @@ async function storageDelete(key) {
 
 async function loadCondominios(){
   try{
-    const r = await storageGet('condominios:list');
-    condominios = r ? JSON.parse(r.value) : [];
-  }catch(e){ condominios = []; }
+    const r = await chamarBackend('/api/kv/get', { key:'condominios:list' });
+    if(r && r.erro) throw new Error(r.erro);
+    condominios = (r && r.value) ? JSON.parse(r.value) : [];
+    condominiosCarregados = true;
+  }catch(e){ condominios = []; condominiosCarregados = false; showToast('Não foi possível carregar a lista de condomínios: ' + e.message); }
 }
 async function saveCondominios(){
+  if(!condominiosCarregados) throw new Error('A lista de condomínios não foi carregada. Recarregue a página antes de alterar.');
   await storageSet('condominios:list', JSON.stringify(condominios));
 }
-async function loadMasterConfig(){
-  try{
-    const r = await storageGet('master:config');
-    if(r) masterConfig = {...masterConfig, ...JSON.parse(r.value)};
-  }catch(e){}
-}
-async function saveMasterConfig(){
-  await storageSet('master:config', JSON.stringify(masterConfig));
+async function carregarEstadoAdmin(){
+  try{ estadoAdmin = await chamarPublico('/api/admin/estado', null, 'GET'); }catch(e){}
 }
 
 function resetSessionState(){
@@ -442,37 +437,28 @@ async function salvarEdicaoMorador(){
   }
 }
 async function executarAlterarSenha(){
-  if(!novaSenh.trim()){ showToast('Defina uma nova senha.'); return; }
-  if(novaSenh !== confirmarSenha){ showToast('As senhas não conferem.'); return; }
-  if(novaSenh.length < 4){ showToast('A senha deve ter pelo menos 4 caracteres.'); return; }
-  const morador = residents.find(r=>r.id === moradorAuth);
-  if(!morador)return;
-  morador.senha = novaSenh;
-  residents = residents.map(r=>r.id===morador.id ? morador : r);
-  await saveResidents();
-  fecharModal();
-  showToast('Senha alterada com sucesso!');
-}
-// Gera um PIN novo para o síndico de qualquer condomínio (usado pelo administrador)
-async function definirPinSindico(condoId, novoPin){
-  let cfg = defaultConfig();
+  if(!novaSenh.trim()){ showToast('Defina o novo código.'); return; }
+  if(novaSenh !== confirmarSenha){ showToast('Os códigos não conferem.'); return; }
+  if(novaSenh.trim().length < 4){ showToast('O código deve ter pelo menos 4 caracteres.'); return; }
+  if(!sessoes.morador || sessoes.morador.condo !== condoAtual){ showToast('Entre como morador para trocar o código da unidade.'); return; }
+  const corpo = { novo: novaSenh.trim() };
+  let r;
   try{
-    const r = await storageGet('config:'+condoId);
-    if(r && r.value) cfg = {...cfg, ...JSON.parse(r.value)};
-  }catch(e){}
-  cfg.pin = novoPin;
-  await storageSetConfirmado('config:'+condoId, JSON.stringify(cfg));
-  if(condoAtual === condoId) config.pin = novoPin; // mantém a tela aberta em sincronia
+    const resp = await fetch(urlServidor('/api/morador/alterar-codigo'), { method:'POST', headers:{ 'Content-Type':'application/json', Authorization:'Bearer '+sessoes.morador.token }, body: JSON.stringify(corpo) });
+    r = await resp.json().catch(()=>null);
+    if(!resp.ok) throw new Error((r && r.erro) || 'HTTP '+resp.status);
+  }catch(e){ showToast('Não foi possível trocar o código: ' + e.message); return; }
+  fecharModal();
+  showToast('Código de acesso alterado! Use o novo código na próxima vez.');
 }
+// Pede ao servidor um PIN novo para o síndico de um condomínio (só o administrador pode)
 async function executarResetSenha(){
-  if(!masterAuth){ showToast('Apenas o administrador pode resetar o PIN do síndico.'); return; }
+  if(!sessoes.admin){ showToast('Apenas o administrador pode resetar o PIN do síndico.'); return; }
   const alvo = condoResetAlvo || condoAtual;
   if(!alvo){ showToast('Condomínio não identificado.'); return; }
-  const novoPin = gerarPINAleatorio();
-  try{
-    await definirPinSindico(alvo, novoPin);
-  }catch(e){ showToast(e.message || 'Não foi possível salvar o novo PIN.'); return; }
-  pinGeradoRecente = novoPin;
+  const r = await chamarBackend('/api/admin/resetar-pin', { condo: alvo });
+  if(!r || r.erro || !r.pin){ showToast((r && r.erro) || 'Não foi possível gerar o novo PIN.'); return; }
+  pinGeradoRecente = r.pin;
   condominioResetPin = alvo;
   pinEhInicial = false;
   mostrarModal(); // reabre o modal já mostrando o PIN gerado
@@ -484,11 +470,12 @@ function fecharResultadoPin(){
 
 /* ---- recuperação da senha do administrador ---- */
 async function gerarNovoCodigoRecuperacao(){
-  const codigo = gerarCodigoRecuperacao();
-  const hash = await hashTexto(normalizarCodigo(codigo));
-  const novo = {...masterConfig, recoveryHash: hash, recoveryCriadoEm: Date.now()};
-  await storageSetConfirmado('master:config', JSON.stringify(novo));
-  masterConfig = novo;
+  const r = await chamarBackend('/api/admin/codigo-recuperacao', {});
+  if(!r || r.erro || !r.codigo) throw new Error((r && r.erro) || 'Não foi possível gerar o código.');
+  mostrarCodigoRecuperacao(r.codigo, r);
+}
+function mostrarCodigoRecuperacao(codigo, estado){
+  if(estado) estadoAdmin = { senhaPadrao: !!estado.senhaPadrao, temCodigoRecuperacao: !!estado.temCodigoRecuperacao, recoveryCriadoEm: estado.recoveryCriadoEm||null };
   codigoRecuperacaoRecente = codigo;
   modalEdicao = 'codigo-recuperacao';
   mostrarModal();
@@ -595,14 +582,32 @@ function exportarVisitantesPDF(){
 }
 
 async function initApp(){
-  await loadCondominios();
-  await loadMasterConfig();
+  restaurarSessoes();
+  await carregarEstadoAdmin();
   const params = new URLSearchParams(window.location.search);
   const condoParam = params.get('condo');
-  if(condoParam && condominios.some(c=>c.id===condoParam)){
-    condoAtual = condoParam;
-    await loadCondoData(condoAtual);
-    view = 'morador'; // força a tela do morador
+  if(condoParam){
+    try{
+      const info = await chamarPublico('/api/publico/condo?id=' + encodeURIComponent(condoParam), null, 'GET');
+      if(!condominios.some(c=>c.id===info.id)) condominios.push({ id: info.id, nome: info.nome });
+      condoAtual = info.id;
+      view = 'morador'; // força a tela do morador
+      if(sessoes.morador && sessoes.morador.condo===condoAtual){
+        moradorAuth = { unidade: sessoes.morador.unidade, nomeSugerido: sessoes.morador.nome };
+        formState.unidade = sessoes.morador.unidade;
+        visitorFormState.unidade = sessoes.morador.unidade;
+        visitorFormState.nomeMorador = sessoes.morador.nome;
+      }
+      if(papelNoCondo(condoAtual)==='sindico') sindicoAuth = true;
+      await loadCondoData(condoAtual);
+      return;
+    }catch(e){
+      if(e.status !== 404) showToast('Não foi possível falar com o servidor: ' + e.message);
+    }
+  } else if(sessoes.admin){
+    // administrador que recarregou a página continua logado
+    masterAuth = true; condoScreenState = 'masterPanel';
+    await loadCondominios();
   }
   carregando = false;
   render();
@@ -631,6 +636,10 @@ async function entrarNoCondo(id){
 }
 
 function sairDoCondo(){
+  // quem não é administrador sai também do login deste condomínio
+  if(sessoes.sindico && sessoes.sindico.condo===condoAtual) sairDaSessao('sindico');
+  if(!sessoes.admin){ condominios = []; }
+  else { masterAuth = true; condoScreenState = 'masterPanel'; }
   condoAtual = null;
   condoScreenState = 'landing';
   resetSessionState();
@@ -640,12 +649,22 @@ function sairDoCondo(){
 }
 
 /* ---------- storage helpers (escopados por condomínio) ---------- */
+let configCarregada = false; // evita sobrescrever a configuração do servidor com valores em branco
 async function loadCondoData(condoId){
-  config = defaultConfig();
-  try{
-    const r = await storageGet('config:'+condoId);
-    if(r) config = {...config, ...JSON.parse(r.value)};
-  }catch(e){}
+  config = defaultConfig(); configCarregada = false;
+  residents = []; messages = []; visitors = [];
+  const papel = papelNoCondo(condoId);
+  if(papel){
+    try{
+      const r = await chamarBackend('/api/kv/get', { key:'config:'+condoId });
+      if(r && r.erro) throw new Error(r.erro);
+      if(r && r.value) config = {...config, ...JSON.parse(r.value)};
+      config.pin = '';
+      configCarregada = true;
+    }catch(e){ showToast('Não foi possível carregar a configuração: ' + e.message); }
+  }
+  // morador não recebe lista de moradores, mensagens nem visitantes
+  if(papel !== 'admin' && papel !== 'sindico'){ carregando = false; render(); return; }
   try{
     const r = await storageGet('residents:'+condoId);
     residents = r ? JSON.parse(r.value) : [];
@@ -683,6 +702,7 @@ async function loadCondoData(condoId){
 }
 
 async function saveConfig(){
+  if(!configCarregada && papelNoCondo(condoAtual) !== 'morador') throw new Error('A configuração não foi carregada do servidor. Recarregue a página antes de salvar.');
   await storageSet('config:'+condoAtual, JSON.stringify(config));
 }
 async function uploadRegimento(file){
@@ -733,14 +753,18 @@ async function saveVisitor(v){
 /* ---------- backend de envio real (WhatsApp/e-mail) ---------- */
 async function chamarBackend(caminho, corpo){
   if(!backendConfig) return { erro:'backend_nao_configurado' };
+  const token = tokenAtual();
+  if(caminho==='/api/notificar-sindico' && corpo && !corpo.condo) corpo = {...corpo, condo: condoAtual};
   try{
-    const resp = await fetch(backendConfig.url.replace(/\/+$/,'') + caminho, {
-      method:'POST',
-      headers: { 'Content-Type':'application/json', 'x-api-key': backendConfig.apiKey||'' },
-      body: JSON.stringify(corpo)
-    });
+    const headers = { 'Content-Type':'application/json' };
+    if(token) headers.Authorization = 'Bearer ' + token;
+    const resp = await fetch(urlServidor(caminho), { method:'POST', headers, body: JSON.stringify(corpo) });
     let dados = null;
     try{ dados = await resp.json(); }catch(e){}
+    if(resp.status===401 && dados && dados.sessaoExpirada){
+      if(token) tratarSessaoExpirada(token);
+      return { erro: 'Sessão expirada. Entre novamente.' };
+    }
     if(!resp.ok) return { erro: (dados && dados.erro) || ('HTTP '+resp.status) };
     return dados || {};
   }catch(e){
@@ -897,6 +921,7 @@ function render(){
   } else if(view==='morador'){
     app.appendChild(renderMorador());
   } else {
+    if(!sindicoAuth && sessoes.admin) sindicoAuth = true; // administrador não precisa do PIN
     app.appendChild(sindicoAuth ? renderSindico() : renderPinGate());
   }
   if(toastMsg){
@@ -940,7 +965,7 @@ function renderHeader(){
   if(moradorAuth){
     const altSenha = document.createElement('button');
     altSenha.className='icon-btn'; altSenha.style.color='var(--muted)'; altSenha.style.fontSize='12px';
-    altSenha.textContent='Alterar senha';
+    altSenha.textContent='Trocar código';
     altSenha.onclick = ()=> abrirModalAlterarSenha();
     h.appendChild(altSenha);
   }
@@ -984,15 +1009,22 @@ function renderMasterGate(){
   inp.type='password'; inp.placeholder='Senha de administrador'; inp.value=masterPinValue;
   inp.oninput = e=> masterPinValue = e.target.value;
   inp.onkeydown = e=>{ if(e.key==='Enter') tryEntrar(); };
-  function tryEntrar(){
-    if(masterPinValue === masterConfig.pin){ masterAuth=true; condoScreenState='masterPanel'; masterPinValue=''; render(); }
-    else showToast('Senha incorreta.');
+  async function tryEntrar(){
+    if(!masterPinValue){ showToast('Digite a senha.'); return; }
+    try{
+      const r = await chamarPublico('/api/auth/admin', { senha: masterPinValue });
+      definirSessao('admin', { token: r.token });
+      estadoAdmin = { senhaPadrao: !!r.senhaPadrao, temCodigoRecuperacao: !!r.temCodigoRecuperacao, recoveryCriadoEm: r.recoveryCriadoEm||null };
+      masterAuth=true; condoScreenState='masterPanel'; masterPinValue='';
+      await loadCondominios();
+      render();
+    }catch(e){ showToast(e.message); }
   }
   const btn = document.createElement('button');
   btn.className='btn btn-primary'; btn.style.marginTop='12px'; btn.textContent='Entrar';
   btn.onclick = tryEntrar;
   card.appendChild(inp); card.appendChild(btn);
-  if(masterConfig.pin === 'admin123'){
+  if(estadoAdmin.senhaPadrao){
     const hint = document.createElement('p'); hint.className='lead'; hint.style.marginTop='10px'; hint.style.fontSize='12px';
     hint.textContent = 'Primeiro acesso: senha padrão admin123. Troque-a assim que entrar.';
     card.appendChild(hint);
@@ -1016,7 +1048,7 @@ function renderMasterRecover(){
   card.className='card pin-gate';
   const voltar = ()=>{ recState = { codigo:'', validado:false, nova:'', confirma:'' }; condoScreenState='masterGate'; render(); };
 
-  if(!masterConfig.recoveryHash){
+  if(!estadoAdmin.temCodigoRecuperacao){
     card.innerHTML = `<h2>Recuperar senha do administrador</h2><p class="lead">Nenhum código de recuperação foi gerado para esta instalação, então a senha não pode ser redefinida por aqui.</p><p class="lead" style="font-size:12.5px">Para recuperar o acesso, quem administra o servidor precisa apagar o registro <code>master:config</code>. Depois disso, a senha volta a ser a padrão (<strong>admin123</strong>). Entre e troque-a em seguida.</p>`;
   } else if(!recState.validado){
     card.innerHTML = `<h2>Recuperar senha do administrador</h2><p class="lead">Digite o código de recuperação que você anotou (formato XXXX-XXXX-XXXX).</p>`;
@@ -1026,9 +1058,8 @@ function renderMasterRecover(){
     inp.oninput = e=> recState.codigo = e.target.value;
     const validar = async ()=>{
       try{
-        const h = await hashTexto(normalizarCodigo(recState.codigo));
-        if(h === masterConfig.recoveryHash){ recState.validado = true; render(); }
-        else showToast('Código de recuperação inválido.');
+        await chamarPublico('/api/admin/recuperar', { codigo: recState.codigo });
+        recState.validado = true; render();
       }catch(e){ showToast(e.message); }
     };
     inp.onkeydown = e=>{ if(e.key==='Enter') validar(); };
@@ -1043,20 +1074,16 @@ function renderMasterRecover(){
     const salvar = async ()=>{
       if(recState.nova.length < 6){ showToast('A senha deve ter pelo menos 6 caracteres.'); return; }
       if(recState.nova !== recState.confirma){ showToast('As senhas não conferem.'); return; }
-      // confere o código de novo antes de gravar
-      const h = await hashTexto(normalizarCodigo(recState.codigo));
-      if(h !== masterConfig.recoveryHash){ showToast('Código de recuperação inválido.'); return; }
-      const novo = {...masterConfig, pin: recState.nova};
-      delete novo.recoveryHash; delete novo.recoveryCriadoEm; // o código usado deixa de valer
-      try{ await storageSetConfirmado('master:config', JSON.stringify(novo)); }
+      let r;
+      try{ r = await chamarPublico('/api/admin/recuperar', { codigo: recState.codigo, nova: recState.nova }); }
       catch(e){ showToast(e.message); return; }
-      masterConfig = novo;
+      definirSessao('admin', { token: r.token });
       recState = { codigo:'', validado:false, nova:'', confirma:'' };
       masterAuth = true; condoScreenState='masterPanel';
+      await loadCondominios();
       render();
-      // gera e mostra imediatamente um novo código de recuperação
-      try{ await gerarNovoCodigoRecuperacao(); }
-      catch(e){ showToast('Senha alterada. Gere um novo código de recuperação no painel.'); }
+      // o código usado deixou de valer: mostra na hora o novo, gerado pelo servidor
+      mostrarCodigoRecuperacao(r.codigo, r);
     };
     c.onkeydown = e=>{ if(e.key==='Enter') salvar(); };
     const b = document.createElement('button');
@@ -1079,9 +1106,15 @@ function renderMasterPanel(){
   const h2 = document.createElement('h2'); h2.style.margin='0'; h2.textContent='Administrar condomínios';
   const sair = document.createElement('button');
   sair.className='btn btn-ghost'; sair.textContent='Sair';
-  sair.onclick = ()=>{ masterAuth=false; condoScreenState='landing'; render(); };
+  sair.onclick = async ()=>{ await sairDaSessao('admin'); masterAuth=false; condoScreenState='landing'; condominios=[]; render(); };
   topBar.appendChild(h2); topBar.appendChild(sair);
   wrap.appendChild(topBar);
+  if(estadoAdmin.senhaPadrao){
+    const aviso = document.createElement('div');
+    aviso.className='warn'; aviso.style.marginBottom='16px';
+    aviso.textContent = 'Você ainda está usando a senha padrão (admin123). Troque-a abaixo e gere o código de recuperação.';
+    wrap.appendChild(aviso);
+  }
 
   const newCard = document.createElement('div');
   newCard.className='card';
@@ -1096,15 +1129,19 @@ function renderMasterPanel(){
   createBtn.className='btn btn-primary'; createBtn.textContent='Criar condomínio';
   createBtn.onclick = async ()=>{
     if(!novoCondoNome.trim()){ showToast('Informe o nome do condomínio.'); return; }
+    if(!condominiosCarregados){ showToast('A lista de condomínios não foi carregada. Recarregue a página.'); return; }
     const novo = { id: gerarSlug(novoCondoNome), nome: novoCondoNome.trim(), criadoEm: Date.now() };
-    const pinInicial = gerarPINAleatorio();
+    let pinInicial;
     try{
-      // cada condomínio novo já nasce com um PIN de síndico aleatório (nada de 1234)
-      const cfg = {...defaultConfig(), nomeCondominio: novo.nome, pin: pinInicial};
+      const cfg = {...defaultConfig(), nomeCondominio: novo.nome};
       await storageSetConfirmado('config:'+novo.id, JSON.stringify(cfg));
-    }catch(e){ showToast(e.message); return; }
-    condominios.push(novo);
-    await saveCondominios();
+      condominios.push(novo);
+      await saveCondominios();
+      // cada condomínio novo já nasce com um PIN de síndico aleatório, gerado pelo servidor
+      const r = await chamarBackend('/api/admin/resetar-pin', { condo: novo.id });
+      if(!r || r.erro || !r.pin) throw new Error((r && r.erro) || 'Não foi possível gerar o PIN do síndico. Use "Resetar PIN do síndico".');
+      pinInicial = r.pin;
+    }catch(e){ showToast(e.message); render(); return; }
     novoCondoNome='';
     render();
     pinGeradoRecente = pinInicial; condominioResetPin = novo.id; condoResetAlvo = novo.id; pinEhInicial = true;
@@ -1135,10 +1172,9 @@ function renderMasterPanel(){
   mpBtn.onclick = async ()=>{
     if(novaMaster.length < 6){ showToast('A senha deve ter pelo menos 6 caracteres.'); return; }
     if(novaMaster !== confMaster){ showToast('As senhas não conferem.'); return; }
-    const novo = {...masterConfig, pin: novaMaster};
-    try{ await storageSetConfirmado('master:config', JSON.stringify(novo)); }
-    catch(e){ showToast(e.message); return; }
-    masterConfig = novo;
+    const r = await chamarBackend('/api/admin/senha', { nova: novaMaster });
+    if(!r || r.erro){ showToast((r && r.erro) || 'Não foi possível trocar a senha.'); return; }
+    estadoAdmin.senhaPadrao = false;
     showToast('Senha de administrador atualizada.');
     render();
   };
@@ -1147,10 +1183,10 @@ function renderMasterPanel(){
 
   const recCard = document.createElement('div');
   recCard.className='card';
-  const temCodigo = !!masterConfig.recoveryHash;
+  const temCodigo = !!estadoAdmin.temCodigoRecuperacao;
   recCard.innerHTML = `<h2>Código de recuperação</h2><p class="lead" style="font-size:13px">${
     temCodigo
-      ? 'Existe um código de recuperação ativo (gerado em ' + new Date(masterConfig.recoveryCriadoEm||Date.now()).toLocaleDateString('pt-BR') + '). Use-o em “Esqueci a senha” se perder a senha de administrador. Gerar um novo invalida o anterior.'
+      ? 'Existe um código de recuperação ativo (gerado em ' + new Date(estadoAdmin.recoveryCriadoEm||Date.now()).toLocaleDateString('pt-BR') + '). Use-o em “Esqueci a senha” se perder a senha de administrador. Gerar um novo invalida o anterior.'
       : '<strong style="color:var(--danger,#A44B36)">Nenhum código gerado.</strong> Sem ele, se você esquecer a senha de administrador, não será possível recuperá-la por aqui. Gere agora e guarde num lugar seguro.'
   }</p>`;
   const recBtn = document.createElement('button');
@@ -1198,8 +1234,9 @@ function renderMasterPanel(){
       const rmBtn = document.createElement('button');
       rmBtn.className='btn btn-danger'; rmBtn.textContent='Remover da lista';
       rmBtn.onclick = async ()=>{
+        const antes = condominios;
         condominios = condominios.filter(x=>x.id!==c.id);
-        await saveCondominios();
+        try{ await saveCondominios(); }catch(e){ condominios = antes; showToast(e.message); }
         render();
       };
       const pinBtn = document.createElement('button');
@@ -1241,9 +1278,10 @@ function renderMorador(){
   left.textContent = 'Acesso liberado para a unidade: ' + moradorAuth.unidade;
   const sair = document.createElement('button');
   sair.className='icon-btn'; sair.style.color='var(--ink-soft)'; sair.textContent='Sair';
-  sair.onclick = ()=>{
+  sair.onclick = async ()=>{
+    await sairDaSessao('morador');
     moradorAuth = null; gateUnidade=''; gateCodigo='';
-    formState.unidade=''; visitorFormState.unidade='';
+    formState.unidade=''; visitorFormState.unidade=''; visitorFormState.nomeMorador='';
     render();
   };
   info.appendChild(left); info.appendChild(sair);
@@ -1316,16 +1354,21 @@ function renderMoradorGate(){
   btn.onclick = tryEntrar;
   card.appendChild(btn);
 
-  function tryEntrar(){
+  async function tryEntrar(){
     if(!gateUnidade.trim() || !gateCodigo.trim()){ showToast('Preencha unidade e código.'); return; }
-    const match = residents.find(r => normaliza(r.unidade)===normaliza(gateUnidade) && normaliza(r.codigo)===normaliza(gateCodigo));
-    if(!match){ showToast('Unidade ou código incorretos. Fale com o síndico.'); return; }
+    let match;
+    try{
+      match = await chamarPublico('/api/auth/morador', { condo: condoAtual, unidade: gateUnidade, codigo: gateCodigo });
+    }catch(e){ showToast(e.message); return; }
+    definirSessao('morador', { token: match.token, condo: condoAtual, unidade: match.unidade, nome: match.nome });
     moradorAuth = { unidade: match.unidade, nomeSugerido: match.nome };
     formState.unidade = match.unidade;
     visitorFormState.unidade = match.unidade;
     visitorFormState.nomeMorador = match.nome;
     gateUnidade=''; gateCodigo='';
-    render();
+    // síndico/administrador já têm a configuração completa; morador carrega a parte pública
+    if(papelNoCondo(condoAtual)==='morador'){ carregando = true; render(); await loadCondoData(condoAtual); }
+    else render();
   }
 
   wrap.appendChild(card);
@@ -1778,9 +1821,15 @@ function renderPinGate(){
   const btn = document.createElement('button');
   btn.className='btn btn-primary'; btn.style.marginTop='12px'; btn.textContent='Entrar';
   btn.onclick = tryLogin;
-  function tryLogin(){
-    if(pinValue === config.pin){ sindicoAuth = true; pinValue=''; render(); }
-    else showToast('PIN incorreto.');
+  async function tryLogin(){
+    if(!pinValue){ showToast('Digite o PIN.'); return; }
+    try{
+      const r = await chamarPublico('/api/auth/sindico', { condo: condoAtual, pin: pinValue });
+      definirSessao('sindico', { token: r.token, condo: condoAtual });
+      sindicoAuth = true; pinValue='';
+      carregando = true; render();
+      await loadCondoData(condoAtual);
+    }catch(e){ showToast(e.message); }
   }
   card.appendChild(inp);
   card.appendChild(btn);
@@ -2527,15 +2576,21 @@ function renderConfig(){
   const pinCard = document.createElement('div');
   pinCard.className='card';
   pinCard.innerHTML = `<h2>Acesso do síndico</h2>`;
-  const pinField = field('PIN de acesso', null);
+  const pinField = field('Novo PIN (mínimo 4 caracteres)', null);
   const pinInput = document.createElement('input');
-  pinInput.type='text'; pinInput.value=config.pin;
+  pinInput.type='password'; pinInput.autocomplete='new-password'; pinInput.value='';
+  pinInput.placeholder='Deixe em branco para manter o atual';
   pinInput.oninput = e=> config.pin = e.target.value;
   pinField.appendChild(pinInput);
   pinCard.appendChild(pinField);
   const savePinBtn = document.createElement('button');
   savePinBtn.className='btn btn-ghost'; savePinBtn.textContent='Salvar PIN';
-  savePinBtn.onclick = async ()=>{ await saveConfig(); showToast('PIN atualizado.'); };
+  savePinBtn.onclick = async ()=>{
+    if(!config.pin || config.pin.trim().length < 4){ showToast('Digite o novo PIN (mínimo 4 caracteres).'); return; }
+    try{ await saveConfig(); }catch(e){ showToast(e.message); return; }
+    config.pin = ''; pinInput.value = '';
+    showToast('PIN atualizado.');
+  };
   pinCard.appendChild(savePinBtn);
   wrap.appendChild(pinCard);
 
@@ -2837,56 +2892,31 @@ function renderConfig(){
 
 /* ---------- init ---------- */
 function renderSetupGate(){
+  // Só aparece se BACKEND_URL_PADRAO estiver vazio (uso de teste)
   const app = document.getElementById('app');
   app.innerHTML = '';
   const card = document.createElement('div');
   card.className='card pin-gate';
   card.style.marginTop='60px';
-  card.innerHTML = `<h2>Conectar ao servidor</h2><p class="lead">Antes de usar o painel, informe o endereço do backend e a chave de API que você configurou no Render. Isso só precisa ser feito uma vez neste navegador.</p>`;
+  card.innerHTML = `<h2>Conectar ao servidor</h2><p class="lead">Informe o endereço do servidor (backend) do portal.</p>`;
   const urlField = field('URL do backend', null);
   const urlInput = document.createElement('input');
   urlInput.type='text'; urlInput.placeholder='https://seu-app.onrender.com';
   urlField.appendChild(urlInput);
   card.appendChild(urlField);
-  const keyField = field('Chave de API', null);
-  const keyInput = document.createElement('input');
-  keyInput.type='password'; keyInput.placeholder='A mesma API_KEY definida no Render';
-  keyField.appendChild(keyInput);
-  card.appendChild(keyField);
-  const erroMsg = document.createElement('p');
-  erroMsg.style.color='var(--brick)'; erroMsg.style.fontSize='13px'; erroMsg.style.minHeight='16px';
-  card.appendChild(erroMsg);
   const btn = document.createElement('button');
   btn.className='btn btn-primary'; btn.textContent='Conectar';
-  btn.onclick = async ()=>{
+  btn.onclick = ()=>{
     const url = urlInput.value.trim();
-    const apiKey = keyInput.value.trim();
-    if(!url || !apiKey){ erroMsg.textContent='Preencha os dois campos.'; return; }
-    btn.textContent='Conectando...'; btn.disabled=true; erroMsg.textContent='';
-    try{
-      const resp = await fetch(url.replace(/\/+$/,'') + '/api/kv/list', {
-        method:'POST',
-        headers:{ 'Content-Type':'application/json', 'x-api-key': apiKey },
-        body: JSON.stringify({ prefix:'' })
-      });
-      if(!resp.ok){
-        erroMsg.textContent = resp.status===401 ? 'Chave de API incorreta.' : 'Não foi possível conectar (HTTP '+resp.status+').';
-        btn.textContent='Conectar'; btn.disabled=false;
-        return;
-      }
-    }catch(e){
-      erroMsg.textContent = 'Não foi possível conectar: ' + e.message;
-      btn.textContent='Conectar'; btn.disabled=false;
-      return;
-    }
-    salvarConfigServidor({ url, apiKey });
+    if(!url){ showToast('Informe o endereço.'); return; }
+    salvarConfigServidor({ url });
     initApp();
   };
   card.appendChild(btn);
   app.appendChild(card);
 }
 
-if(backendConfig && backendConfig.url && backendConfig.apiKey){
+if(backendConfig && backendConfig.url){
   initApp();
 } else {
   renderSetupGate();
@@ -2963,14 +2993,14 @@ function renderModal(){
     document.getElementById('modal-res-nome').focus();
   } else if(modalEdicao === 'alterar-senha'){
     body.innerHTML = `
-      <h2>Alterar Senha</h2>
+      <h2>Trocar código de acesso da unidade</h2>
       <div class="modal-input-group">
-        <label>Nova Senha</label>
-        <input type="password" id="modal-nova-senha" placeholder="Mínimo 4 caracteres" onchange="novaSenh=this.value">
+        <label>Novo código</label>
+        <input type="password" id="modal-nova-senha" placeholder="Mínimo 4 caracteres" oninput="novaSenh=this.value">
       </div>
       <div class="modal-input-group">
-        <label>Confirmar Senha</label>
-        <input type="password" id="modal-confirmar-senha" placeholder="Repita a senha" onchange="confirmarSenha=this.value">
+        <label>Repita o novo código</label>
+        <input type="password" id="modal-confirmar-senha" placeholder="Repita o código" oninput="confirmarSenha=this.value">
       </div>
       <div class="modal-buttons">
         <button class="btn-secondary" onclick="fecharModal()">Cancelar</button>
