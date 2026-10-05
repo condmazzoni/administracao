@@ -267,9 +267,40 @@ let senhaAtual = '';
 let visitanteFiltro = 'todos'; // todos | pendente | aprovado | reprovado
 let pinGeradoRecente = null; // PIN gerado recentemente para exibir apenas uma vez
 let condominioResetPin = null; // qual condominio teve o reset de PIN
+let condoResetAlvo = null;      // condomínio escolhido no painel do administrador para resetar o PIN
+let pinEhInicial = false;      // true quando o PIN mostrado é o de um condomínio recém-criado
+let codigoRecuperacaoRecente = null; // código de recuperação do administrador, exibido uma única vez
 
+function numeroAleatorio(max){
+  if(window.crypto && window.crypto.getRandomValues){
+    const a = new Uint32Array(1); window.crypto.getRandomValues(a); return a[0] % max;
+  }
+  return Math.floor(Math.random() * max);
+}
 function gerarPINAleatorio(){
-  return Math.floor(1000 + Math.random() * 9000).toString();
+  return String(1000 + numeroAleatorio(9000));
+}
+// Código de recuperação no formato XXXX-XXXX-XXXX (sem letras/números que se confundem: 0/O, 1/I/L)
+function gerarCodigoRecuperacao(){
+  const alfabeto = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for(let i=0;i<12;i++){ if(i && i%4===0) s+='-'; s += alfabeto[numeroAleatorio(alfabeto.length)]; }
+  return s;
+}
+function normalizarCodigo(c){ return String(c||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+async function hashTexto(t){
+  if(!(window.crypto && window.crypto.subtle)) throw new Error('Este navegador não suporta a verificação segura. Abra o portal pelo endereço https.');
+  const buf = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+// Grava e confirma que o servidor aceitou (para nunca mostrar uma senha que não foi salva)
+async function storageSetConfirmado(key, value){
+  if(backendConfig){
+    const r = await chamarBackend('/api/kv/set', { key, value });
+    if(r && r.erro) throw new Error('O servidor não confirmou a gravação ('+r.erro+'). Tente novamente.');
+  } else {
+    await window.storage.set(key, value, true);
+  }
 }
 
 function defaultConfig(){
@@ -371,8 +402,10 @@ function abrirModalAlterarSenha(){
   modalEdicao = 'alterar-senha';
   mostrarModal();
 }
-function abrirModalResetSenha(){
+function abrirModalResetSenha(condoId){
   senhaAtual = '';
+  condoResetAlvo = condoId || condoAtual;
+  pinGeradoRecente = null;
   modalEdicao = 'reset-senha';
   mostrarModal();
 }
@@ -420,15 +453,50 @@ async function executarAlterarSenha(){
   fecharModal();
   showToast('Senha alterada com sucesso!');
 }
+// Gera um PIN novo para o síndico de qualquer condomínio (usado pelo administrador)
+async function definirPinSindico(condoId, novoPin){
+  let cfg = defaultConfig();
+  try{
+    const r = await storageGet('config:'+condoId);
+    if(r && r.value) cfg = {...cfg, ...JSON.parse(r.value)};
+  }catch(e){}
+  cfg.pin = novoPin;
+  await storageSetConfirmado('config:'+condoId, JSON.stringify(cfg));
+  if(condoAtual === condoId) config.pin = novoPin; // mantém a tela aberta em sincronia
+}
 async function executarResetSenha(){
+  if(!masterAuth){ showToast('Apenas o administrador pode resetar o PIN do síndico.'); return; }
+  const alvo = condoResetAlvo || condoAtual;
+  if(!alvo){ showToast('Condomínio não identificado.'); return; }
   const novoPin = gerarPINAleatorio();
+  try{
+    await definirPinSindico(alvo, novoPin);
+  }catch(e){ showToast(e.message || 'Não foi possível salvar o novo PIN.'); return; }
   pinGeradoRecente = novoPin;
-  condominioResetPin = condoAtual;
-  config.pin = novoPin;
-  await saveConfig();
+  condominioResetPin = alvo;
+  pinEhInicial = false;
+  mostrarModal(); // reabre o modal já mostrando o PIN gerado
+}
+function fecharResultadoPin(){
+  pinGeradoRecente = null; condominioResetPin = null; condoResetAlvo = null;
   fecharModal();
-  showToast('✓ PIN resetado! Anote o novo PIN acima.');
-  renderMasterPanel();
+}
+
+/* ---- recuperação da senha do administrador ---- */
+async function gerarNovoCodigoRecuperacao(){
+  const codigo = gerarCodigoRecuperacao();
+  const hash = await hashTexto(normalizarCodigo(codigo));
+  const novo = {...masterConfig, recoveryHash: hash, recoveryCriadoEm: Date.now()};
+  await storageSetConfirmado('master:config', JSON.stringify(novo));
+  masterConfig = novo;
+  codigoRecuperacaoRecente = codigo;
+  modalEdicao = 'codigo-recuperacao';
+  mostrarModal();
+}
+function fecharCodigoRecuperacao(){
+  codigoRecuperacaoRecente = null;
+  fecharModal();
+  render();
 }
 
 /* ---- exportação de dados ---- */
@@ -891,6 +959,10 @@ function renderSemCondo(){
     wrap.appendChild(renderMasterGate());
     return wrap;
   }
+  if(condoScreenState==='masterRecover'){
+    wrap.appendChild(renderMasterRecover());
+    return wrap;
+  }
   const card = document.createElement('div');
   card.className='card pin-gate';
   card.innerHTML = `<h2>Portal do condomínio</h2><p class="lead">Este link não está associado a um condomínio específico. Se você é morador ou síndico, peça o link correto para a administração.</p>`;
@@ -920,12 +992,81 @@ function renderMasterGate(){
   btn.className='btn btn-primary'; btn.style.marginTop='12px'; btn.textContent='Entrar';
   btn.onclick = tryEntrar;
   card.appendChild(inp); card.appendChild(btn);
-  const hint = document.createElement('p'); hint.className='lead'; hint.style.marginTop='10px'; hint.style.fontSize='12px';
-  hint.textContent = 'Senha padrão: admin123 (altere depois de entrar).';
-  card.appendChild(hint);
+  if(masterConfig.pin === 'admin123'){
+    const hint = document.createElement('p'); hint.className='lead'; hint.style.marginTop='10px'; hint.style.fontSize='12px';
+    hint.textContent = 'Primeiro acesso: senha padrão admin123. Troque-a assim que entrar.';
+    card.appendChild(hint);
+  }
+  const esqueci = document.createElement('button');
+  esqueci.className='btn btn-ghost'; esqueci.style.marginTop='10px'; esqueci.textContent='Esqueci a senha';
+  esqueci.onclick = ()=>{ recState = { codigo:'', validado:false, nova:'', confirma:'' }; condoScreenState='masterRecover'; render(); };
+  card.appendChild(esqueci);
   const back = document.createElement('button');
   back.className='btn btn-ghost'; back.style.marginTop='4px'; back.textContent='Voltar';
   back.onclick = ()=>{ condoScreenState='landing'; render(); };
+  card.appendChild(back);
+  wrap.appendChild(card);
+  return wrap;
+}
+
+let recState = { codigo:'', validado:false, nova:'', confirma:'' };
+function renderMasterRecover(){
+  const wrap = document.createElement('div');
+  const card = document.createElement('div');
+  card.className='card pin-gate';
+  const voltar = ()=>{ recState = { codigo:'', validado:false, nova:'', confirma:'' }; condoScreenState='masterGate'; render(); };
+
+  if(!masterConfig.recoveryHash){
+    card.innerHTML = `<h2>Recuperar senha do administrador</h2><p class="lead">Nenhum código de recuperação foi gerado para esta instalação, então a senha não pode ser redefinida por aqui.</p><p class="lead" style="font-size:12.5px">Para recuperar o acesso, quem administra o servidor precisa apagar o registro <code>master:config</code>. Depois disso, a senha volta a ser a padrão (<strong>admin123</strong>). Entre e troque-a em seguida.</p>`;
+  } else if(!recState.validado){
+    card.innerHTML = `<h2>Recuperar senha do administrador</h2><p class="lead">Digite o código de recuperação que você anotou (formato XXXX-XXXX-XXXX).</p>`;
+    const inp = document.createElement('input');
+    inp.type='text'; inp.placeholder='Código de recuperação'; inp.value=recState.codigo; inp.autocomplete='off';
+    inp.style.textTransform='uppercase'; inp.style.letterSpacing='2px';
+    inp.oninput = e=> recState.codigo = e.target.value;
+    const validar = async ()=>{
+      try{
+        const h = await hashTexto(normalizarCodigo(recState.codigo));
+        if(h === masterConfig.recoveryHash){ recState.validado = true; render(); }
+        else showToast('Código de recuperação inválido.');
+      }catch(e){ showToast(e.message); }
+    };
+    inp.onkeydown = e=>{ if(e.key==='Enter') validar(); };
+    const b = document.createElement('button');
+    b.className='btn btn-primary'; b.style.marginTop='12px'; b.textContent='Validar código';
+    b.onclick = validar;
+    card.appendChild(inp); card.appendChild(b);
+  } else {
+    card.innerHTML = `<h2>Definir nova senha</h2><p class="lead">Código validado. Escolha a nova senha de administrador (mínimo 6 caracteres).</p>`;
+    const n = document.createElement('input'); n.type='password'; n.placeholder='Nova senha'; n.oninput = e=> recState.nova = e.target.value;
+    const c = document.createElement('input'); c.type='password'; c.placeholder='Repita a nova senha'; c.style.marginTop='8px'; c.oninput = e=> recState.confirma = e.target.value;
+    const salvar = async ()=>{
+      if(recState.nova.length < 6){ showToast('A senha deve ter pelo menos 6 caracteres.'); return; }
+      if(recState.nova !== recState.confirma){ showToast('As senhas não conferem.'); return; }
+      // confere o código de novo antes de gravar
+      const h = await hashTexto(normalizarCodigo(recState.codigo));
+      if(h !== masterConfig.recoveryHash){ showToast('Código de recuperação inválido.'); return; }
+      const novo = {...masterConfig, pin: recState.nova};
+      delete novo.recoveryHash; delete novo.recoveryCriadoEm; // o código usado deixa de valer
+      try{ await storageSetConfirmado('master:config', JSON.stringify(novo)); }
+      catch(e){ showToast(e.message); return; }
+      masterConfig = novo;
+      recState = { codigo:'', validado:false, nova:'', confirma:'' };
+      masterAuth = true; condoScreenState='masterPanel';
+      render();
+      // gera e mostra imediatamente um novo código de recuperação
+      try{ await gerarNovoCodigoRecuperacao(); }
+      catch(e){ showToast('Senha alterada. Gere um novo código de recuperação no painel.'); }
+    };
+    c.onkeydown = e=>{ if(e.key==='Enter') salvar(); };
+    const b = document.createElement('button');
+    b.className='btn btn-primary'; b.style.marginTop='12px'; b.textContent='Salvar nova senha';
+    b.onclick = salvar;
+    card.appendChild(n); card.appendChild(c); card.appendChild(b);
+  }
+  const back = document.createElement('button');
+  back.className='btn btn-ghost'; back.style.marginTop='8px'; back.textContent='Voltar';
+  back.onclick = voltar;
   card.appendChild(back);
   wrap.appendChild(card);
   return wrap;
@@ -956,11 +1097,19 @@ function renderMasterPanel(){
   createBtn.onclick = async ()=>{
     if(!novoCondoNome.trim()){ showToast('Informe o nome do condomínio.'); return; }
     const novo = { id: gerarSlug(novoCondoNome), nome: novoCondoNome.trim(), criadoEm: Date.now() };
+    const pinInicial = gerarPINAleatorio();
+    try{
+      // cada condomínio novo já nasce com um PIN de síndico aleatório (nada de 1234)
+      const cfg = {...defaultConfig(), nomeCondominio: novo.nome, pin: pinInicial};
+      await storageSetConfirmado('config:'+novo.id, JSON.stringify(cfg));
+    }catch(e){ showToast(e.message); return; }
     condominios.push(novo);
     await saveCondominios();
     novoCondoNome='';
-    showToast('Condomínio criado.');
     render();
+    pinGeradoRecente = pinInicial; condominioResetPin = novo.id; condoResetAlvo = novo.id; pinEhInicial = true;
+    modalEdicao = 'reset-senha';
+    mostrarModal();
   };
   newCard.appendChild(createBtn);
   wrap.appendChild(newCard);
@@ -968,17 +1117,50 @@ function renderMasterPanel(){
   const masterPinCard = document.createElement('div');
   masterPinCard.className='card';
   masterPinCard.innerHTML = `<h2>Senha de administrador</h2>`;
-  const mpField = field('Senha', null);
+  let novaMaster = '', confMaster = '';
+  const mpField = field('Nova senha (mínimo 6 caracteres)', null);
   const mpInput = document.createElement('input');
-  mpInput.type='text'; mpInput.value=masterConfig.pin;
-  mpInput.oninput = e=> masterConfig.pin = e.target.value;
+  mpInput.type='password'; mpInput.autocomplete='new-password';
+  mpInput.oninput = e=> novaMaster = e.target.value;
   mpField.appendChild(mpInput);
   masterPinCard.appendChild(mpField);
+  const mcField = field('Repita a nova senha', null);
+  const mcInput = document.createElement('input');
+  mcInput.type='password'; mcInput.autocomplete='new-password';
+  mcInput.oninput = e=> confMaster = e.target.value;
+  mcField.appendChild(mcInput);
+  masterPinCard.appendChild(mcField);
   const mpBtn = document.createElement('button');
   mpBtn.className='btn btn-ghost'; mpBtn.textContent='Salvar senha';
-  mpBtn.onclick = async ()=>{ await saveMasterConfig(); showToast('Senha de administrador atualizada.'); };
+  mpBtn.onclick = async ()=>{
+    if(novaMaster.length < 6){ showToast('A senha deve ter pelo menos 6 caracteres.'); return; }
+    if(novaMaster !== confMaster){ showToast('As senhas não conferem.'); return; }
+    const novo = {...masterConfig, pin: novaMaster};
+    try{ await storageSetConfirmado('master:config', JSON.stringify(novo)); }
+    catch(e){ showToast(e.message); return; }
+    masterConfig = novo;
+    showToast('Senha de administrador atualizada.');
+    render();
+  };
   masterPinCard.appendChild(mpBtn);
   wrap.appendChild(masterPinCard);
+
+  const recCard = document.createElement('div');
+  recCard.className='card';
+  const temCodigo = !!masterConfig.recoveryHash;
+  recCard.innerHTML = `<h2>Código de recuperação</h2><p class="lead" style="font-size:13px">${
+    temCodigo
+      ? 'Existe um código de recuperação ativo (gerado em ' + new Date(masterConfig.recoveryCriadoEm||Date.now()).toLocaleDateString('pt-BR') + '). Use-o em “Esqueci a senha” se perder a senha de administrador. Gerar um novo invalida o anterior.'
+      : '<strong style="color:var(--danger,#A44B36)">Nenhum código gerado.</strong> Sem ele, se você esquecer a senha de administrador, não será possível recuperá-la por aqui. Gere agora e guarde num lugar seguro.'
+  }</p>`;
+  const recBtn = document.createElement('button');
+  recBtn.className = temCodigo ? 'btn btn-ghost' : 'btn btn-primary';
+  recBtn.textContent = temCodigo ? 'Gerar novo código' : 'Gerar código de recuperação';
+  recBtn.onclick = async ()=>{
+    try{ await gerarNovoCodigoRecuperacao(); }catch(e){ showToast(e.message); }
+  };
+  recCard.appendChild(recBtn);
+  wrap.appendChild(recCard);
 
   const listCard = document.createElement('div');
   listCard.className='card';
@@ -1020,7 +1202,10 @@ function renderMasterPanel(){
         await saveCondominios();
         render();
       };
-      actions.appendChild(copyBtn); actions.appendChild(enterBtn); actions.appendChild(editBtn); actions.appendChild(rmBtn);
+      const pinBtn = document.createElement('button');
+      pinBtn.className='btn btn-ghost'; pinBtn.textContent='Resetar PIN do síndico';
+      pinBtn.onclick = ()=> abrirModalResetSenha(c.id);
+      actions.appendChild(copyBtn); actions.appendChild(enterBtn); actions.appendChild(editBtn); actions.appendChild(pinBtn); actions.appendChild(rmBtn);
       row.appendChild(info); row.appendChild(actions);
       listCard.appendChild(row);
     });
@@ -1601,7 +1786,7 @@ function renderPinGate(){
   card.appendChild(btn);
   const hint = document.createElement('p');
   hint.className='lead'; hint.style.marginTop='10px'; hint.style.fontSize='12px';
-  hint.textContent = 'PIN padrão: 1234 (altere em Configurações após entrar).';
+  hint.textContent = 'Esqueceu o PIN? Peça à administração para gerar um novo.';
   card.appendChild(hint);
   wrap.appendChild(card);
   return wrap;
@@ -2793,24 +2978,39 @@ function renderModal(){
       </div>
     `;
     document.getElementById('modal-nova-senha').focus();
+  } else if(modalEdicao === 'codigo-recuperacao'){
+    body.innerHTML = `
+      <h2>Código de recuperação do administrador</h2>
+      <p style="font-size: 13px; color: #666; margin-bottom: 16px;">Guarde este código num lugar seguro (anotado em papel, no gerenciador de senhas ou no seu e-mail). Ele permite redefinir a senha de administrador em “Esqueci a senha”. Cada código vale uma única vez.</p>
+      <div style="background: #E7F1EA; border: 2px solid #3F7D58; border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 16px;">
+        <p style="font-size: 24px; font-weight: 700; color: #3F7D58; margin: 0; font-family: monospace; letter-spacing: 3px;">${escapeHtml(codigoRecuperacaoRecente||'')}</p>
+      </div>
+      <p style="font-size: 12px; color: #A44B36; background: #F6E8E4; padding: 12px; border-radius: 6px; margin: 0;">⚠️ Este código não será mostrado de novo depois que você fechar esta janela.</p>
+      <div class="modal-buttons">
+        <button class="btn-secondary" onclick="navigator.clipboard && navigator.clipboard.writeText(codigoRecuperacaoRecente).then(()=>showToast('Código copiado.'))">Copiar</button>
+        <button class="btn-primary" onclick="fecharCodigoRecuperacao()">Já anotei</button>
+      </div>
+    `;
   } else if(modalEdicao === 'reset-senha'){
-    if(pinGeradoRecente && condominioResetPin === condoAtual){
+    const alvoInfo = condoInfo(condoResetAlvo || condoAtual);
+    const alvoNome = alvoInfo ? alvoInfo.nome : 'este condomínio';
+    if(pinGeradoRecente && condominioResetPin === (condoResetAlvo || condoAtual)){
       body.innerHTML = `
-        <h2>✓ PIN Resetado com Sucesso!</h2>
-        <p style="font-size: 13px; color: #666; margin-bottom: 20px;">Um novo PIN foi gerado para o síndico. Anote este PIN e envie para o síndico via WhatsApp ou email:</p>
+        <h2>${pinEhInicial ? '✓ Condomínio criado' : '✓ PIN do síndico definido'}</h2>
+        <p style="font-size: 13px; color: #666; margin-bottom: 20px;">${pinEhInicial ? 'PIN de acesso do síndico de' : 'Novo PIN do síndico de'} <strong>${escapeHtml(alvoNome)}</strong>.${pinEhInicial ? '' : ' O PIN anterior deixou de funcionar.'} Envie este ao síndico por WhatsApp ou e-mail:</p>
         <div style="background: #E7F1EA; border: 2px solid #3F7D58; border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 20px;">
           <p style="font-size: 12px; color: #666; margin: 0 0 8px;">Novo PIN:</p>
           <p style="font-size: 28px; font-weight: 700; color: #3F7D58; margin: 0; font-family: monospace; letter-spacing: 4px;">${pinGeradoRecente}</p>
         </div>
         <p style="font-size: 12px; color: #A44B36; background: #F6E8E4; padding: 12px; border-radius: 6px; margin: 0;">⚠️ Este PIN será ocultado ao fechar esta janela. Anote agora!</p>
         <div class="modal-buttons">
-          <button class="btn-secondary" onclick="fecharModal(); pinGeradoRecente = null;">Fechar</button>
+          <button class="btn-primary" onclick="fecharResultadoPin()">Já anotei</button>
         </div>
       `;
     } else {
       body.innerHTML = `
         <h2>Resetar PIN do Síndico</h2>
-        <p>Um novo PIN aleatório de 4 dígitos será gerado para este condomínio.</p>
+        <p>Um novo PIN aleatório de 4 dígitos será gerado para <strong>${escapeHtml(alvoNome)}</strong>. O PIN atual deixará de funcionar.</p>
         <p style="font-size: 13px; color: #666;">Você poderá ver o PIN apenas uma vez após confirmação. Anote e compartilhe com o síndico.</p>
         <div class="modal-buttons">
           <button class="btn-secondary" onclick="fecharModal()">Cancelar</button>
